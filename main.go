@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v2"
 	"gorm.io/driver/postgres"
 	"gorm.io/datatypes"
@@ -48,6 +50,39 @@ type AlertWebhook struct {
 		EndsAt      time.Time         `json:"endsAt"`
 		Fingerprint string            `json:"fingerprint"`
 	} `json:"alerts"`
+}
+
+// Prometheus metrics
+var (
+	irmWebhooksAlertmanagerTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "irm_webhooks_alertmanager_total",
+			Help: "Total number of received webhooks",
+		},
+	)
+	irmWebhooksAlertmanagerNewTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "irm_webhooks_alertmanager_new_total",
+			Help: "Total number of new unique webhook inserted into the database",
+		},
+	)
+	irmWebhooksAlertmanagerDuplicateTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "irm_webhooks_alertmanager_duplicate_total",
+			Help: "Total number of duplicate webhooks (already exists in DB)",
+		},
+	)
+	irmWebhooksAlertmanagerUpdatedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "irm_webhooks_alertmanager_updated_total",
+			Help: "Total number of webhooks that were updated",
+		},
+	)
+)
+
+func init() {
+	// Register metrics with Prometheus
+	prometheus.MustRegister(irmWebhooksAlertmanagerTotal, irmWebhooksAlertmanagerNewTotal, irmWebhooksAlertmanagerDuplicateTotal, irmWebhooksAlertmanagerUpdatedTotal)
 }
 
 // loadConfig reads configuration from a YAML file.
@@ -93,6 +128,16 @@ func main() {
 	// Initialize Gin router.
 	router := gin.Default()
 
+	// Health check endpoint
+	router.GET("/healthz", func(c *gin.Context) {
+		sqlDB, err := db.DB()
+		if err != nil || sqlDB.Ping() != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "unhealthy", "error": "database unreachable"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+	})
+
 	// Define the webhook endpoint.
 	router.POST("/api/v1/webhooks/alertmanager", func(c *gin.Context) {
 		var webhook AlertWebhook
@@ -100,6 +145,9 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+
+		// Increment total received alerts counter
+		irmWebhooksAlertmanagerTotal.Add(float64(len(webhook.Alerts)))
 
 		// Process each alert in the payload.
 		for _, alert := range webhook.Alerts {
@@ -134,24 +182,32 @@ func main() {
 						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 						return
 					}
+
+					// Increment new alerts counter
+					irmWebhooksAlertmanagerNewTotal.Inc()
 				} else {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 					return
 				}
 			} else {
-				// Alert already exists.
-				// If the status has changed, update the status field.
+
 				if existing.Status != alert.Status {
-					if err := db.Model(&existing).Update("status", alert.Status).Error; err != nil {
+					if err := db.Model(&existing).Select("Status", "EndsAt").Updates(Alert{Status: alert.Status,EndsAt: alert.EndsAt}).Error; err != nil {
 						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 						return
 					}
+					irmWebhooksAlertmanagerUpdatedTotal.Inc()
+				} else {
+                    irmWebhooksAlertmanagerDuplicateTotal.Inc()
 				}
 			}
 		}
 
 		c.JSON(http.StatusOK, gin.H{"status": "alerts processed"})
 	})
+
+	// Prometheus metrics endpoint
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Run the server on port 8080.
 	router.Run(":8080")
